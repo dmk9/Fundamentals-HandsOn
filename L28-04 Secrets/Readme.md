@@ -42,3 +42,6 @@ on Linux/Mac
 
     kubectl delete -f secrets.yaml
     kubectl delete -f pod.yaml --force --grace-period=0
+
+[K8s Secrets](https://kubernetes.io/docs/concepts/configuration/secret/)
+[Encrypting data at rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/)
