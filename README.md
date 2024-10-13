@@ -45,3 +45,13 @@ You’ll learn about microservices and their use cases. You’ll then learn abou
 Guy Barrette is a developer/trainer with more then 25 years of experience. He worked for many years as a developer, solutions architect, Microsoft Certified Trainer and now he shares his passion for containers and microservices teaching Docker and Kubernetes. He was awarded Microsoft Most Valuable Professional in the Azure category and passed the following certifications: Kubernetes and Cloud Native Associate, Certified Kubernetes Application Developer (CKAD), Terraform Certified Associate, AWS Cloud Practitioner, Google Cloud Associate Cloud Engineer, Azure Fundamentals, Azure Developer Associate and Azure Architect Design.
 
 https://guybarrette.com @GuyBarrette @guybarrette@techhub.social
+
+![alt text](image.png)
+
+![alt text](image-1.png)
+
+![alt text](image-2.png)
+
+![alt text](image-3.png)
+
+![alt text](image-4.png)

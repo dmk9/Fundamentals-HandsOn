@@ -1,0 +1,613 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - release/**
+  pull_request:
+    branches:
+      - master
+      - release/**
+
+permissions: write-all
+
+jobs:
+  linting-and-formatting:
+    name: Linting and Formatting Check
+    runs-on: mastery-general
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node Environment and Install Dependencies
+        uses: ./.github/composite-actions/env-setup
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+
+      - name: Lint
+        run: yarn lint:ci
+
+      - name: Format
+        run: yarn format:ci
+
+  graphql-schema-check:
+    name: GraphQL Schema Check
+    runs-on: mastery-general
+    strategy:
+      matrix:
+        variant: [mm100dev, mm100test, sn100prod]
+        service:
+          [
+            { name: 'BookingsApi', path: './apps/bookings-api/src/resources/schema.graphql' },
+            {
+              name: 'RequestToBook',
+              path: './apps/client-booking-integrations/src/rtb-introspection.schema.graphql',
+            },
+            {
+              name: 'BookingRouteAssignmentValidations',
+              path: './apps/route-assignment-validations/src/graphql/schema.graphql',
+            },
+          ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run API Schema Check (${{ matrix.service.name }})
+        uses: masterysystems/global-github-actions/actions/apollo-schema@main
+        with:
+          apollo-key: ${{ secrets.APOLLO_FEDERATION_KEY }}
+          apollo-subscription-key: ${{ secrets.APOLLO_SUBSCRIPTION_KEY }}
+          service-name: ${{ matrix.service.name }}
+          apollo-variant: ${{ matrix.variant }}
+          schema-path: ${{ matrix.service.path }}
+        env:
+          APOLLO_KEY: ${{secrets.APOLLO_FEDERATION_KEY}}
+          APOLLO_VCS_COMMIT: ${{ github.event.pull_request.head.sha }}
+
+      - name: Upload Schema Check Output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rover-log
+          path: ./rover-log.txt
+
+  kafka-schema-check:
+    name: Kafka Schema Check
+    runs-on: mastery-general
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node Environment and Install Dependencies
+        uses: ./.github/composite-actions/env-setup
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+
+      - name: Check Avro Schema(s) Compatibility
+        run: MASTERY_AUTO_SCHEMA_USERNAME=${{ secrets.LACHESIS_AUTO_SCHEMA_USERNAME }} MASTERY_AUTO_SCHEMA_PASSWORD=${{ secrets.LACHESIS_AUTO_SCHEMA_PASSWORD }} yarn topics:check-schema-compatibility
+
+  verify-docker-images:
+    name: Verify Docker Images
+    runs-on: mastery-general
+    timeout-minutes: 10
+
+    env:
+      ARTIFACTORY_HOSTNAME: masterysys.jfrog.io/bookie-docker-local
+    strategy:
+      matrix:
+        dockerfile:
+          [
+            { name: 'bookings-api', path: 'apps/bookings-api/Dockerfile' },
+            { name: 'bookings-seer-consumer', path: 'apps/seer-consumer/Dockerfile' },
+            { name: 'bin-ingress', path: 'apps/bin-ingress/Dockerfile' },
+            {
+              name: 'client-booking-integrations',
+              path: 'apps/client-booking-integrations/Dockerfile',
+            },
+            { name: 'bookings-e2e-tests', path: 'apps/bookings-api/test/support/Test.Dockerfile' },
+            {
+              name: 'route-assignment-validations',
+              path: 'apps/route-assignment-validations/Dockerfile',
+            },
+            {
+              name: 'route-assignment-validations-acat',
+              path: 'apps/route-assignment-validations/test/ACAT/Test.Dockerfile',
+            },
+          ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Login to the Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: masterysys.jfrog.io
+          username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        id: setup-buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify ${{ matrix.dockerfile.name }} Docker Image Builds Successfully
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile.path }}
+          build-args: |
+            NPM_TOKEN=${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+            PROD=true
+          tags: |
+            ${{ env.ARTIFACTORY_HOSTNAME }}/${{ matrix.dockerfile.name }}:${{ github.sha }}
+            ${{ env.ARTIFACTORY_HOSTNAME }}/${{ matrix.dockerfile.name }}:latest
+          push: false
+          cache-from: |
+            type=gha,scope=${{ matrix.dockerfile.name }}
+          cache-to: |
+            type=gha,scope=${{ matrix.dockerfile.name }},mode=max
+  unit-test-chunks-setup:
+    name: Unit Test Chunks Setup
+    runs-on: mastery-general
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Test Chunks Setup
+        id: test-chunks-setup
+        uses: ./.github/composite-actions/test-chunks
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+          test-command: 'ci:test:unit:list'
+          test-command-ids: 'ci:test:unit:list:ids'
+
+    outputs:
+      unit-test-chunks: ${{ steps.test-chunks-setup.outputs.test-chunks }}
+      unit-test-chunk-ids: ${{ steps.test-chunks-setup.outputs.test-chunk-ids }}
+
+  unit-tests:
+    name: Unit Tests (Chunk ${{ matrix.chunk }})
+    runs-on: mastery-general
+    needs: [unit-test-chunks-setup]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.unit-test-chunks-setup.outputs['unit-test-chunk-ids']) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node Environment and Install Dependencies
+        uses: ./.github/composite-actions/env-setup
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+
+      - name: Run Unit Tests (chunk ${{ matrix.chunk }})
+        run: echo $CHUNKS | jq -cM '.[${{ matrix.chunk }}] | .[] | @text' | xargs yarn test:cov --coverageDirectory=unit_coverage__${{ matrix.chunk }}
+        env:
+          CHUNKS: ${{ needs.unit-test-chunks-setup.outputs['unit-test-chunks'] }}
+
+      - name: Cache Unit Test Coverage For Use In SonarQube Job
+        uses: actions/cache@v4
+        with:
+          path: 'unit_coverage__${{ matrix.chunk }}/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-unit-coverage-${{ matrix.chunk }}
+
+  strict-build-checks:
+    name: Strict Build Checks
+    runs-on: mastery-general
+    strategy:
+      matrix:
+        component: [
+            auth,
+            book-it-now-event-constructor,
+            booking-source-type,
+            carrier,
+            context,
+            driver,
+            employee,
+            error-alerting,
+            feature-flag,
+            graphql-client
+            health,
+            live,
+            liveness-helpers,
+            logger,
+            minion,
+            newrelic,
+            newrelic-stats-reporter,
+            redis,
+            route,
+            route-assignment-validation-rules,
+            route-assignment-validations,
+            subscriptions,
+            system-user,
+            typeorm-exception-decorators,
+            types,
+            utils,
+          ]
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node Environment and Install Dependencies
+        uses: ./.github/composite-actions/env-setup
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+
+      - name: Run Strict Build Checks
+        run: yarn build ${{ matrix.component }}
+
+  integration-test-chunks-setup:
+    name: Integration Test Chunks Setup
+    runs-on: mastery-general
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Test Chunks Setup
+        id: test-chunks-setup
+        uses: ./.github/composite-actions/test-chunks
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+          test-command: 'ci:test:integration:list'
+          test-command-ids: 'ci:test:integration:list:ids'
+
+    outputs:
+      integration-test-chunks: ${{ steps.test-chunks-setup.outputs.test-chunks }}
+      integration-test-chunk-ids: ${{ steps.test-chunks-setup.outputs.test-chunk-ids }}
+
+  integration-tests:
+    name: Integration Tests (Chunk ${{ matrix.chunk }})
+    runs-on: mastery-general
+    needs: [integration-test-chunks-setup]
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.integration-test-chunks-setup.outputs['integration-test-chunk-ids']) }}
+
+    # These environment variables are required in test:integration:setup for database migrations
+    # Other environment variables used in tests are defined within ci.env
+    env:
+      KEYCLOAK_SECRET: ${{ secrets.MASTERY_DEV_KEYCLOAK_SECRET }}
+      LAUNCH_DARKLY_SDK: ${{ secrets.LAUNCH_DARKLY_SDK }}
+      GEONAMES_TOKEN: ${{ secrets.GEONAMES_TOKEN }}
+      GEONAMES_USERNAME: ${{ secrets.GEONAMES_USERNAME }}
+      TYPEORM_DB: Bookings
+      TYPEORM_HOST: localhost
+      TYPEORM_PORT: 31635
+      TYPEORM_USERNAME: sa
+      TYPEORM_PASSWORD: MSSqlServer2019
+      SEER_DB_HOST: localhost
+      SEER_DB_SCHEMA: dbo
+      SEER_DB_PORT: 31635
+      SEER_DB_NAME: Seer
+      SEER_DB_USER: sa
+      SEER_DB_PASSWORD: MSSqlServer2019
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      ENVIRONMENT: ci
+      NEW_RELIC_API_USER_KEY: ${{ secrets.NEW_RELIC_API_KEY }}
+      NEW_RELIC_ACCOUNT_ID: 2452316
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node Environment and Install Dependencies
+        uses: ./.github/composite-actions/env-setup
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+
+      - name: Setup Integration Test Infrastructure
+        run: yarn test:integration:setup
+
+      - name: Run Integration Tests (chunk ${{ matrix.chunk }})
+        uses: nick-fields/retry@v3
+        with:
+          retry_on: error
+          timeout_minutes: 15
+          max_attempts: 3
+          command: echo $CHUNKS | jq -cM '.[${{ matrix.chunk }}] | .[] | @text' | xargs yarn test:integration:cov --forceExit --coverageDirectory=integration_coverage__${{ matrix.chunk }}
+          new_command_on_retry: echo $CHUNKS | jq -cM '.[${{ matrix.chunk }}] | .[] | @text' | xargs yarn test:integration:cov --onlyFailures --forceExit --coverageDirectory=integration_coverage__${{ matrix.chunk }}
+        env:
+          CHUNKS: ${{ needs.integration-test-chunks-setup.outputs['integration-test-chunks'] }}
+
+      - name: Cache Integration Test Coverage
+        uses: actions/cache@v4
+        with:
+          path: 'integration_coverage__${{ matrix.chunk }}/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-integration-coverage-${{ matrix.chunk }}
+
+  sonarqube:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Disabling shallow clone is recommended for improving relevancy of reporting
+          fetch-depth: 0
+
+      - name: Restore unit test coverage for use in sonarqube
+        uses: actions/cache@v4
+        with:
+          path: 'unit_coverage/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_rumber }}-unit-coverage
+
+      - name: Restore Unit Test Coverage - chunk 0
+        uses: actions/cache@v4
+        with:
+          path: 'unit_coverage__0/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-unit-coverage-0
+
+      - name: Restore Unit Test Coverage - chunk 1
+        uses: actions/cache@v4
+        with:
+          path: 'unit_coverage__1/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-unit-coverage-1
+
+      - name: Restore Unit Test Coverage - chunk 2
+        uses: actions/cache@v4
+        with:
+          path: 'unit_coverage__2/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-unit-coverage-2
+
+      - name: Restore Unit Test Coverage - chunk 3
+        uses: actions/cache@v4
+        with:
+          path: 'unit_coverage__3/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-unit-coverage-3
+
+      - name: Restore Integration Test Coverage - chunk 0
+        uses: actions/cache@v4
+        with:
+          path: 'integration_coverage__0/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-integration-coverage-0
+
+      - name: Restore Integration Test Coverage - chunk 1
+        uses: actions/cache@v4
+        with:
+          path: 'integration_coverage__1/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-integration-coverage-1
+
+      - name: Restore Integration Test Coverage - chunk 2
+        uses: actions/cache@v4
+        with:
+          path: 'integration_coverage__2/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-integration-coverage-2
+
+      - name: Restore Integration Test Coverage - chunk 3
+        uses: actions/cache@v4
+        with:
+          path: 'integration_coverage__3/lcov.info'
+          key: ${{ github.run_id }}-${{ github.run_number }}-integration-coverage-3
+
+      - name: Combine Test Coverage
+        run: echo 'coverage directories ============>'; ls *coverage*;
+          mkdir all_test_coverage;
+          cp unit_coverage__0/lcov.info all_test_coverage/unit-0.lcov.info;
+          cp unit_coverage__1/lcov.info all_test_coverage/unit-1.lcov.info;
+          cp unit_coverage__2/lcov.info all_test_coverage/unit-2.lcov.info;
+          cp unit_coverage__3/lcov.info all_test_coverage/unit-3.lcov.info;
+          cp integration_coverage__0/lcov.info all_test_coverage/integration-0.lcov.info;
+          cp integration_coverage__1/lcov.info all_test_coverage/integration-1.lcov.info;
+          cp integration_coverage__2/lcov.info all_test_coverage/integration-2.lcov.info;
+          cp integration_coverage__3/lcov.info all_test_coverage/integration-3.lcov.info;
+          ls all_test_coverage;
+          npx lcov-result-merger 'all_test_coverage/*' coverage_merged.info;
+
+      - uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  fetch-and-find-files:
+    name: Retrieve and Locate Files for tsc Check
+    runs-on: mastery-general
+
+    outputs:
+      newFiles: ${{ steps.fetch-files.outputs.newFiles }}
+      changedFiles: ${{ steps.fetch-files.outputs.changedFiles }}
+      masterFiles: ${{ steps.fetch-files.outputs.masterFiles }}
+      currentFiles: ${{ steps.fetch-files.outputs.currentFiles }}
+      currentBranch: ${{ steps.fetch-files.outputs.currentBranch }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - id: fetch-files
+        uses: ./.github/composite-actions/ts-errors/fetch-files
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+
+  new-files-tsc-check:
+    name: tsc Check On New Files
+    runs-on: mastery-general
+    needs: fetch-and-find-files
+    outputs:
+      results: ${{ steps.ts-errors.outputs.results }}
+      url: ${{ steps.ts-errors.outputs.url }}
+      grade: ${{ steps.ts-errors.outputs.grade }}
+      status: ${{ steps.ts-errors.outputs.status }}
+      fileContents: ${{ steps.ts-errors.outputs.file_contents }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - id: ts-errors
+        uses: ./.github/composite-actions/ts-errors/tsc-check
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+          # tsc check inputs
+          files: ${{ needs.fetch-and-find-files.outputs.newFiles }}
+          file-type: 'New'
+
+  changed-files-tsc-check:
+    name: tsc Check On Changed Files
+    runs-on: mastery-general
+    needs: fetch-and-find-files
+    outputs:
+      results: ${{ steps.ts-errors.outputs.results }}
+      url: ${{ steps.ts-errors.outputs.url }}
+      grade: ${{ steps.ts-errors.outputs.grade }}
+      status: ${{ steps.ts-errors.outputs.status }}
+      fileContents: ${{ steps.ts-errors.outputs.file_contents }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - id: ts-errors
+        uses: ./.github/composite-actions/ts-errors/tsc-check
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+          # tsc check inputs
+          files: ${{ needs.fetch-and-find-files.outputs.changedFiles }}
+          file-type: 'Changed'
+
+  tsc-compare-ts-count-with-master:
+    name: Compare Ts Count With Master
+    runs-on: mastery-general
+    needs: fetch-and-find-files
+    outputs:
+      results: ${{ steps.compare.outputs.result }}
+      url: ${{ steps.compare.outputs.url }}
+      grade: ${{ steps.compare.outputs.grade }}
+      status: ${{ steps.compare.outputs.status }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - id: compare
+        uses: ./.github/composite-actions/ts-errors/compare-errors-with-master
+        with:
+          node-version: 18
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          artifactory-username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          artifactory-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          run-gql-gen: 'false'
+          # tsc check inputs
+          master-files: ${{ needs.fetch-and-find-files.outputs.masterFiles }}
+          current-files: ${{ needs.fetch-and-find-files.outputs.currentFiles }}
+
+  tsc-error-comment:
+    runs-on: mastery-general
+    needs:
+      [
+        new-files-tsc-check,
+        changed-files-tsc-check,
+        tsc-compare-ts-count-with-master,
+        fetch-and-find-files,
+      ]
+    if: github.ref != 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare comment
+        id: pc
+        uses: ./.github/composite-actions/ts-errors/tsc-comment
+        with:
+          npm-token: ${{ secrets.MASTERYSYSTEMS_NPM_REGISTRY_TOKEN }}
+          new-files-tsc-status: ${{ needs.new-files-tsc-check.outputs.status }}
+          new-files-tsc-grade: ${{ needs.new-files-tsc-check.outputs.grade }}
+          new-files-tsc-results: ${{ needs.new-files-tsc-check.outputs.results }}
+          new-files-tsc-url: ${{ needs.new-files-tsc-check.outputs.url }}
+          new-files-tsc-file-contents: ${{ needs.new-files-tsc-check.outputs.fileContents }}
+          changed-files-tsc-status: ${{ needs.changed-files-tsc-check.outputs.status }}
+          changed-files-tsc-grade: ${{ needs.changed-files-tsc-check.outputs.grade }}
+          changed-files-tsc-results: ${{ needs.changed-files-tsc-check.outputs.results }}
+          changed-files-tsc-url: ${{ needs.changed-files-tsc-check.outputs.url }}
+          changed-files-tsc-file-contents: ${{ needs.changed-files-tsc-check.outputs.fileContents }}
+          count-status: ${{ needs.tsc-compare-ts-count-with-master.outputs.status }}
+          count-grade: ${{ needs.tsc-compare-ts-count-with-master.outputs.grade }}
+          count-result: ${{ needs.tsc-compare-ts-count-with-master.outputs.results }}
+          count-url: ${{ needs.tsc-compare-ts-count-with-master.outputs.url }}
+          current-branch: ${{ needs.fetch-and-find-files.outputs.currentBranch }}
+          repo: ${{ github.repository }}
+          pr-number: ${{ github.event.number }}
+          ref: ${{ github.ref }}
+
+  ts-errors-found:
+    runs-on: mastery-general
+    needs:
+      [
+        new-files-tsc-check,
+        changed-files-tsc-check,
+        tsc-compare-ts-count-with-master,
+        tsc-error-comment,
+      ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get the list of files from master and update tsConfig.json
+        id: get_files
+        continue-on-error: true
+        uses: ./.github/composite-actions/ts-errors/errors-found
+        with:
+          new-files-ts-check-grade: ${{ needs.new-files-tsc-check.outputs.grade }}
+          ts-check-grade: ${{ needs.changed-files-tsc-check.outputs.grade }}
+          tsc-compare-ts-master-grade: ${{ needs.tsc-compare-ts-count-with-master.outputs.grade }}
